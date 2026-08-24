@@ -1,0 +1,236 @@
+services:
+  # ====================================================================
+  # 🚀 Приложение 1: HTTP API Сервер (Билетный сервис)
+  # ====================================================================
+  ticket-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ticket-api
+    command: ["./api-server"]
+    restart: on-failure
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - POSTGRES_DSN=postgres://postgres:postgres@ticket-postgres:5432/ticket_db?sslmode=disable
+      - REDIS_ADDR=ticket-redis:6379
+      - KAFKA_ADDR=ticket-kafka:29092 # Внутренний порт Кафки для контейнеров
+    networks:
+      ticket-network:
+        aliases:
+          - host.docker.internal # Фокус: контейнер отвечает на имя хоста для совместимости с prometheus.yml
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ====================================================================
+  # ⚙️ Приложение 2: Пакетный Воркер (Консьюмер, Крон, Флашер)
+  # ====================================================================
+  ticket-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ticket-worker
+    command: ["./batch-worker"]
+    restart: on-failure
+    ports:
+      - "8081:8081"
+    environment:
+      - PORT=8081
+      - POSTGRES_DSN=postgres://postgres:postgres@ticket-postgres:5432/ticket_db?sslmode=disable
+      - REDIS_ADDR=ticket-redis:6379
+      - KAFKA_ADDR=ticket-kafka:29092
+    networks:
+      ticket-network:
+        aliases:
+          - host.docker.internal # Фокус: контейнер отвечает на имя хоста для совместимости с prometheus.yml
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  # ====================================================================
+  # 💾 Бронежилет системы: Высокопроизводительный оперативный кэш Redis
+  # ====================================================================
+  redis:
+    image: redis:8.0-alpine
+    container_name: ticket-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - ticket-network
+
+  # ====================================================================
+  # 🚂 Амортизатор нагрузок: Современная Apache Kafka в режиме KRaft
+  # ====================================================================
+  kafka:
+    image: confluentinc/cp-kafka:7.8.0
+    container_name: ticket-kafka
+    ports:
+      - "9092:9092" # Порт для вашей локальной разработки (вне докера)
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://ticket-kafka:29092,PLAINTEXT_HOST://127.0.0.1:9092' # Исправлен хост на стабильный IP
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REREPLICATION_FACTOR: 1
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@ticket-kafka:29093'
+      KAFKA_LISTENERS: 'PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:29092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    networks:
+      - ticket-network
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.8.0
+    container_name: ticket-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - ticket-network
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "
+      kafka-topics --bootstrap-server kafka:29092
+      --create
+      --if-not-exists
+      --topic orders
+      --partitions 10
+      --replication-factor 1
+      "
+
+  # ====================================================================
+  # 🏛 Финальное надежное хранилище: Реляционная СУБД PostgreSQL
+  # ====================================================================
+  postgres:
+    image: postgres:18-alpine
+    container_name: ticket-postgres
+    ports:
+      - "5439:5432" # Порт наружу 5439, чтобы не конфликтовать с вашей локальной БД если она есть
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ticket_db
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - ./deployments/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ticket_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ticket-network
+
+  # ====================================================================
+  # 📊 Сборщик метрик: Prometheus
+  # ====================================================================
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: ticket-prometheus
+    ports:
+      - "9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./deployments/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    networks:
+      - ticket-network
+
+  # ====================================================================
+  # 🪵 Хранилище логов: Grafana Loki
+  # ====================================================================
+  loki:
+    image: grafana/loki:3.3.0
+    container_name: ticket-loki
+    ports:
+      - "3100:3100"
+    volumes:
+      - loki_data:/loki
+      - ./deployments/monitoring/loki-config.yaml:/etc/loki/local-config.yaml
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - ticket-network
+
+  # ====================================================================
+  # 📉 Визуализация метрик и логов: Grafana
+  # ====================================================================
+  grafana:
+    image: grafana/grafana:11.5.0
+    container_name: ticket-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/etc/grafana/provisioning/dashboards/instances/ticket_dashboard.json
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+      - loki
+    networks:
+      - ticket-network
+
+  # ====================================================================
+  # 🪵 Агент сбора логов и метрик: Grafana Alloy
+  # ====================================================================
+  alloy:
+    image: grafana/alloy:latest
+    container_name: ticket-alloy
+    ports:
+      - "12345:12345"
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - alloy_data:/var/lib/alloy/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command:
+      - run
+      - /etc/alloy/config.alloy
+      - --server.http.listen-addr=0.0.0.0:12345
+    depends_on:
+      - loki
+    networks:
+      - ticket-network
+
+volumes:
+  pgdata:
+  redis_data:
+  kafka_data:
+  prometheus_data:
+  loki_data:
+  grafana_data:
+  alloy_data:
+
+networks:
+  ticket-network:
+    driver: bridge
